@@ -1,8 +1,7 @@
 # ===========================================================
 #  Free Fire Info API + JWT Generator (Vercel-ready)
-#  ✅ /info?uid=xxx                 → hardcoded token pool
-#  ✅ /info?uid=xxx&password=yyy    → guest login (own creds)
-#  ✅ /token?uid=xxx&password=yyy   → JWT token
+#  ✅ Output 100% same as before (sorted keys)
+#  ✅ No external JWT API
 #  Credit: @Jahid_x_Empire
 # ===========================================================
 
@@ -36,7 +35,7 @@ try:
 except ImportError:
     HAS_JWT = False
 
-# ---------- JSON output (SORTED KEYS) ----------
+# ---------- JSON output (SORTED KEYS → same as Flask jsonify) ----------
 try:
     import orjson
     def _jsonify(data, status=200):
@@ -69,7 +68,7 @@ OB_VERSION     = "OB55"
 CLIENT_VERSION = "1.132.1"
 
 # ===========================================================
-# CREDENTIALS (fallback pool for /info without password)
+# CREDENTIALS
 # ===========================================================
 ACCOUNT_CREDENTIALS = {
     "BD":  {"uid": "7999843395",
@@ -87,7 +86,7 @@ REGION_CONFIG = {
 }
 REGION_PRIORITY = ["BD", "IND", "BR"]
 
-# in-memory token cache
+# in-memory token cache (per serverless warm container)
 _token_cache = {}
 
 # ===========================================================
@@ -108,7 +107,7 @@ def encrypt_message(plaintext: bytes) -> bytes:
 
 
 # ===========================================================
-# MANUAL PROTOBUF
+# MANUAL PROTOBUF (MajorLogin payload)
 # ===========================================================
 def encode_varint(value):
     out = []
@@ -358,7 +357,7 @@ def decode_jwt(token):
 
 
 # ===========================================================
-# TOKEN MANAGER (for hardcoded pool accounts)
+# TOKEN MANAGER (cache)
 # ===========================================================
 async def generate_token_direct(region):
     cred = ACCOUNT_CREDENTIALS.get(region)
@@ -380,7 +379,7 @@ async def generate_token_direct(region):
         'token':      f"Bearer {ml['token']}",
         'region':     ml.get('lockRegion') or region,
         'server_url': ml.get('serverUrl') or REGION_CONFIG[region]['server_url'],
-        'expires_at': time.time() + 25200,
+        'expires_at': time.time() + 25200,   # 7 hours
     }
 
 
@@ -396,7 +395,7 @@ async def get_token(region):
 
 
 # ===========================================================
-# FETCH ACCOUNT INFO — via cached pool token
+# ACCOUNT INFO FETCH
 # ===========================================================
 async def GetAccountInformation(uid, region):
     try:
@@ -446,71 +445,6 @@ async def GetAccountInformation(uid, region):
     except Exception as e:
         print(f"❌ GetAccountInformation error ({region}): {e}")
         return None
-
-
-# ===========================================================
-# ✅ NEW: FETCH ACCOUNT INFO — via USER's own guest uid+password
-# ===========================================================
-async def GetAccountInformationWithCreds(uid, password):
-    """
-    User এর নিজের guest uid + password দিয়ে login করে
-    সেই player এর info রিটার্ন করে।
-    """
-    try:
-        # Step 1: OAuth login
-        creds, err = await oauth_guest(uid, password)
-        if err:
-            return None, f"OAuth failed: {err}"
-        open_id, access_token = creds
-
-        # Step 2: MajorLogin → JWT + server url
-        ml, err = await major_login_full(open_id, access_token)
-        if err:
-            return None, f"MajorLogin failed: {err}"
-
-        jwt_token     = ml['token']
-        server_url    = ml['serverUrl']
-        actual_region = ml.get('lockRegion') or 'BD'
-        config = REGION_CONFIG.get(actual_region, REGION_CONFIG["BD"])
-
-        # Step 3: GetPlayerPersonalShow with the user's own JWT
-        req_msg = main_pb2.GetPlayerPersonalShow()
-        json_format.ParseDict({'a': int(uid), 'b': '7'}, req_msg)
-        data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, req_msg.SerializeToString())
-
-        headers = {
-            'User-Agent': USERAGENT,
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Content-Type': "application/octet-stream",
-            'Authorization': f"Bearer {jwt_token}",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': config['release_version'],
-        }
-
-        async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-            resp = await client.post(server_url + '/GetPlayerPersonalShow',
-                                     content=data_enc, headers=headers)
-
-        if resp.status_code != 200:
-            return None, f"GetPlayerPersonalShow HTTP {resp.status_code}"
-
-        account_info = AccountPersonalShow_pb2.AccountPersonalShowInfo()
-        account_info.ParseFromString(resp.content)
-        result = json.loads(json_format.MessageToJson(account_info))
-
-        is_banned = result.get("isBanned", False)
-        if isinstance(is_banned, bool):
-            result["ban_status"] = "🔴 BANNED" if is_banned else "🟢 UNBANNED"
-        else:
-            result["ban_status"] = "❓ UNKNOWN"
-
-        result["region"] = actual_region
-        return result, None
-
-    except Exception as e:
-        return None, f"Creds-fetch error: {e}"
 
 
 # ===========================================================
@@ -564,9 +498,49 @@ def ts_to_bst(ts):
 
 
 # ===========================================================
-# FORMAT RESPONSE (reusable)
+# /info  —  SAME OUTPUT AS BEFORE (SORTED KEYS)
 # ===========================================================
-def build_response(uid, account_data):
+@app.route('/info')
+def get_full_info():
+    uid = request.args.get('uid')
+    if not uid:
+        return _jsonify({"error": "UID required"}, 400)
+    try:
+        uid_int = int(uid)
+    except Exception:
+        return _jsonify({"error": "Invalid UID"}, 400)
+
+    async def try_all_regions_parallel():
+        tasks = [asyncio.create_task(GetAccountInformation(uid_int, r))
+                 for r in REGION_PRIORITY]
+        try:
+            for coro in asyncio.as_completed(tasks, timeout=20):
+                try:
+                    data = await coro
+                    if data:
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        return data
+                except Exception:
+                    continue
+        except asyncio.TimeoutError:
+            pass
+
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        return None
+
+    try:
+        account_data = asyncio.run(try_all_regions_parallel())
+    except Exception as e:
+        print(f"❌ Global error: {e}")
+        account_data = None
+
+    if not account_data:
+        return _jsonify({"error": "Player not found"}, 404)
+
     used_region = account_data.get("region", "Unknown")
 
     basic   = account_data.get("basicInfo", {})
@@ -586,7 +560,7 @@ def build_response(uid, account_data):
     except Exception:
         prime_level = "N/A"
 
-    return {
+    response = {
         "status": "success",
         "server_used": used_region,
         "BanStatus": account_data.get("ban_status", "❓ UNKNOWN"),
@@ -646,73 +620,11 @@ def build_response(uid, account_data):
         },
     }
 
-
-# ===========================================================
-# /info  —  supports BOTH modes
-# ===========================================================
-@app.route('/info')
-def get_full_info():
-    uid = request.args.get('uid')
-    password = request.args.get('password')  # optional
-
-    if not uid:
-        return _jsonify({"error": "UID required"}, 400)
-    try:
-        uid_int = int(uid)
-    except Exception:
-        return _jsonify({"error": "Invalid UID"}, 400)
-
-    # ---------- MODE 1: guest uid + password ----------
-    if password:
-        try:
-            account_data, err = asyncio.run(
-                GetAccountInformationWithCreds(uid, password)
-            )
-        except Exception as e:
-            return _jsonify({"error": f"Login error: {e}"}, 400)
-
-        if err or not account_data:
-            return _jsonify({"error": err or "Player not found"}, 404)
-
-        return _jsonify(build_response(uid, account_data))
-
-    # ---------- MODE 2: no password → use hardcoded pool ----------
-    async def try_all_regions_parallel():
-        tasks = [asyncio.create_task(GetAccountInformation(uid_int, r))
-                 for r in REGION_PRIORITY]
-        try:
-            for coro in asyncio.as_completed(tasks, timeout=20):
-                try:
-                    data = await coro
-                    if data:
-                        for t in tasks:
-                            if not t.done():
-                                t.cancel()
-                        return data
-                except Exception:
-                    continue
-        except asyncio.TimeoutError:
-            pass
-
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        return None
-
-    try:
-        account_data = asyncio.run(try_all_regions_parallel())
-    except Exception as e:
-        print(f"❌ Global error: {e}")
-        account_data = None
-
-    if not account_data:
-        return _jsonify({"error": "Player not found"}, 404)
-
-    return _jsonify(build_response(uid, account_data))
+    return _jsonify(response)
 
 
 # ===========================================================
-# /token  —  guest login → JWT
+# /token  —  SAME OUTPUT AS OLD EXTERNAL API
 # ===========================================================
 def _build_token_response(open_id, access_token, jwt_token):
     decoded = decode_jwt(jwt_token)
@@ -782,14 +694,8 @@ def home():
     return _jsonify({
         "status": "running",
         "version": "OB55",
-        "endpoints": {
-            "info_pool":   "/info?uid=UID",
-            "info_guest":  "/info?uid=UID&password=PASS",
-            "token":       "/token?uid=UID&password=PASS",
-            "access_jwt":  "/access-jwt?open_id=X&access_token=Y",
-        },
-        "example_pool":  "/info?uid=2084018498",
-        "example_guest": "/info?uid=YOUR_GUEST_UID&password=YOUR_PASS",
+        "endpoint": "/info?uid=UID",
+        "example": "/info?uid=2084018498",
         "priority": "BD → IND → BR",
         "credit": "@Itz_Jahid_X"
     })
