@@ -1,10 +1,8 @@
 # ===========================================================
-#  Free Fire Info API + JWT Generator (Vercel-ready)  — V2
-#  ✅ Fixed MajorLogin (multi-candidate decode + X-Ga-Sv fallback)
-#  ✅ /info?uid=xxx                 → hardcoded token pool
-#  ✅ /info?uid=xxx&password=yyy    → guest login (own creds)
-#  ✅ /debug-login?uid=&password=   → raw MajorLogin dump
-#  ✅ /test-oauth?uid=&password=    → OAuth validity check
+#  Free Fire Info API + JWT Generator (Vercel-ready)
+#  ✅ Output 100% same as before (sorted keys)
+#  ✅ No external JWT API
+#  ✅ MajorLogin FIXED — multi-candidate decode + X-Ga-Sv fallback
 #  Credit: @Jahid_x_Empire
 # ===========================================================
 
@@ -39,7 +37,7 @@ try:
 except ImportError:
     HAS_JWT = False
 
-# ---------- JSON output (SORTED KEYS) ----------
+# ---------- JSON output (SORTED KEYS → same as Flask jsonify) ----------
 try:
     import orjson
     def _jsonify(data, status=200):
@@ -71,19 +69,20 @@ LOGIN_URL = "https://loginbp.ppmainecoonghj.com"
 OB_VERSION     = "OB55"
 CLIENT_VERSION = "1.132.1"
 
-# Optional proxy (set via env var: FF_PROXY=http://user:pass@host:port)
+# Optional proxy (Vercel IP block হলে env var দিয়ে set করুন)
+# FF_PROXY=http://user:pass@host:port
 PROXY_URL = os.environ.get("FF_PROXY") or None
 
-# Multiple X-Ga-Sv candidates — try in order until one works
+# Multiple X-Ga-Sv candidates — যেটা কাজ করবে সেটা auto-detect হবে
 X_GA_SV_CANDIDATES = [
-    "1789534056",   # your original
+    "1789534056",
     "1827603724",
     "1887625689",
     "1908374872",
 ]
 
 # ===========================================================
-# CREDENTIALS (fallback pool for /info without password)
+# CREDENTIALS
 # ===========================================================
 ACCOUNT_CREDENTIALS = {
     "BD":  {"uid": "7999843395",
@@ -101,7 +100,7 @@ REGION_CONFIG = {
 }
 REGION_PRIORITY = ["BD", "IND", "BR"]
 
-# in-memory token cache
+# in-memory token cache (per serverless warm container)
 _token_cache = {}
 
 # ===========================================================
@@ -122,7 +121,7 @@ def encrypt_message(plaintext: bytes) -> bytes:
 
 
 # ===========================================================
-# MANUAL PROTOBUF
+# MANUAL PROTOBUF (MajorLogin payload)
 # ===========================================================
 def encode_varint(value):
     out = []
@@ -291,9 +290,21 @@ async def oauth_guest(uid, password):
 # ===========================================================
 # MAJOR LOGIN  (FIXED)
 # ===========================================================
+MAJORLOGIN_HEADERS_BASE = {
+    "User-Agent": "UnityPlayer/2021.3.14f1 (UnityWebRequest/1.0, libcurl/7.84.0-DEV)",
+    "Accept": "*/*",
+    "Accept-Encoding": "deflate, gzip",
+    "Authorization": "Bearer ",
+    "X-Ga": "v1 1",
+    "ReleaseVersion": f"{OB_VERSION}",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "X-Unity-Version": "2021.3.14f1",
+}
+
+
 def _decode_candidates(raw_body):
     """
-    Yield (body_bytes, decoded_dict) for full and stripped bodies.
+    Yield (body_bytes, decoded_dict) for full body and stripped (64-byte) body.
     """
     seen = set()
     candidates = [raw_body]
@@ -345,7 +356,7 @@ def _extract_jwt_and_url(decoded):
     return jwt_token, client_url, region_hint
 
 
-async def major_login_full(open_id, access_token, debug=False):
+async def major_login_full(open_id, access_token):
     if not access_token or not access_token.strip():
         return None, "Missing access_token for MajorLogin"
 
@@ -354,11 +365,10 @@ async def major_login_full(open_id, access_token, debug=False):
 
     url = LOGIN_URL.rstrip('/') + "/MajorLogin"
     last_error = ""
-    debug_log = [] if debug else None
 
     # Try each X-Ga-Sv candidate
-    for sv_index, sv_value in enumerate(X_GA_SV_CANDIDATES):
-        for attempt in range(2):  # 2 attempts per sv value
+    for sv_value in X_GA_SV_CANDIDATES:
+        for attempt in range(2):
             headers = MAJORLOGIN_HEADERS_BASE.copy()
             headers["X-Ga-Sv"] = sv_value
             headers["Authorization"] = f"Bearer {access_token.strip()}"
@@ -367,34 +377,12 @@ async def major_login_full(open_id, access_token, debug=False):
                 async with _client(15.0) as client:
                     r = await client.post(url, content=encrypted, headers=headers)
 
-                if debug:
-                    try:
-                        full_keys = list(decode_protobuf(r.content).keys())
-                    except Exception:
-                        full_keys = "decode-error"
-                    trim_keys = "n/a"
-                    if len(r.content) > 64:
-                        try:
-                            trim_keys = list(decode_protobuf(r.content[64:]).keys())
-                        except Exception:
-                            trim_keys = "decode-error"
-                    debug_log.append({
-                        "sv_value": sv_value,
-                        "attempt": attempt + 1,
-                        "status_code": r.status_code,
-                        "content_length": len(r.content),
-                        "full_keys": full_keys,
-                        "trim_keys": trim_keys,
-                        "raw_hex_head": r.content[:64].hex(),
-                    })
-
                 if r.status_code != 200:
                     last_error = f"HTTP {r.status_code}: {r.content[:150]!r}"
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.6)
                     continue
 
                 # Try all body candidates
-                found = False
                 for body, decoded in _decode_candidates(r.content):
                     jwt_token, client_url, region_hint = _extract_jwt_and_url(decoded)
                     if jwt_token and client_url:
@@ -409,28 +397,24 @@ async def major_login_full(open_id, access_token, debug=False):
                                 lock_region = payload_dec.get("lock_region")
                             except Exception:
                                 pass
-
                         if not lock_region and region_hint:
                             lock_region = region_hint
 
-                        print(f"✅ MajorLogin OK (sv={sv_value}, attempt={attempt+1})")
-                        result = {
+                        print(f"✅ MajorLogin OK (X-Ga-Sv={sv_value})")
+                        return {
                             "token":      jwt_token,
                             "lockRegion": lock_region,
                             "serverUrl":  client_url,
-                        }
-                        if debug:
-                            result["_debug"] = debug_log
-                        return result, None
-                    found = True  # decoded OK but no JWT
+                        }, None
 
-                if not found:
-                    last_error = f"Could not decode protobuf (len={len(r.content)})"
-                else:
-                    last_error = (
-                        f"Decoded OK but no JWT/URL. "
-                        f"len={len(r.content)}, head={r.content[:64].hex()}"
-                    )
+                # Nothing usable in this response
+                try:
+                    keys = list(decode_protobuf(r.content).keys())
+                except Exception:
+                    keys = "decode-error"
+                last_error = (
+                    f"Missing JWT/URL. keys={keys}, len={len(r.content)}"
+                )
 
             except Exception as e:
                 last_error = f"Request error: {e}"
@@ -438,22 +422,7 @@ async def major_login_full(open_id, access_token, debug=False):
             print(f"[!] MajorLogin sv={sv_value} attempt={attempt+1}: {last_error}")
             await asyncio.sleep(0.8)
 
-    if debug:
-        return None, {"error": f"MajorLogin failed: {last_error}", "debug": debug_log}
     return None, f"MajorLogin failed after retries: {last_error}"
-
-
-# Base headers (X-Ga-Sv added per attempt)
-MAJORLOGIN_HEADERS_BASE = {
-    "User-Agent": "UnityPlayer/2021.3.14f1 (UnityWebRequest/1.0, libcurl/7.84.0-DEV)",
-    "Accept": "*/*",
-    "Accept-Encoding": "deflate, gzip",
-    "Authorization": "Bearer ",
-    "X-Ga": "v1 1",
-    "ReleaseVersion": f"{OB_VERSION}",
-    "Content-Type": "application/x-www-form-urlencoded",
-    "X-Unity-Version": "2021.3.14f1",
-}
 
 
 def decode_jwt(token):
@@ -466,7 +435,7 @@ def decode_jwt(token):
 
 
 # ===========================================================
-# TOKEN MANAGER (for hardcoded pool accounts)
+# TOKEN MANAGER (cache)
 # ===========================================================
 async def generate_token_direct(region):
     cred = ACCOUNT_CREDENTIALS.get(region)
@@ -488,7 +457,7 @@ async def generate_token_direct(region):
         'token':      f"Bearer {ml['token']}",
         'region':     ml.get('lockRegion') or region,
         'server_url': ml.get('serverUrl') or REGION_CONFIG[region]['server_url'],
-        'expires_at': time.time() + 25200,
+        'expires_at': time.time() + 25200,   # 7 hours
     }
 
 
@@ -504,7 +473,7 @@ async def get_token(region):
 
 
 # ===========================================================
-# FETCH ACCOUNT INFO — via cached pool token
+# ACCOUNT INFO FETCH  — via cached pool token
 # ===========================================================
 async def GetAccountInformation(uid, region):
     try:
@@ -557,9 +526,12 @@ async def GetAccountInformation(uid, region):
 
 
 # ===========================================================
-# ✅ FETCH ACCOUNT INFO — via USER's own guest uid+password
+# ACCOUNT INFO FETCH  — via USER's own guest uid + password
 # ===========================================================
 async def GetAccountInformationWithCreds(uid, password):
+    """
+    User এর নিজের guest uid + password দিয়ে login করে সেই player এর info।
+    """
     try:
         creds, err = await oauth_guest(uid, password)
         if err:
@@ -609,7 +581,6 @@ async def GetAccountInformationWithCreds(uid, password):
 
         result["region"] = actual_region
         return result, None
-
     except Exception as e:
         return None, f"Creds-fetch error: {e}"
 
@@ -749,12 +720,12 @@ def build_response(uid, account_data):
 
 
 # ===========================================================
-# /info  —  supports BOTH modes
+# /info  —  pool mode + guest mode
 # ===========================================================
 @app.route('/info')
 def get_full_info():
     uid = request.args.get('uid')
-    password = request.args.get('password')
+    password = request.args.get('password')  # optional
 
     if not uid:
         return _jsonify({"error": "UID required"}, 400)
@@ -763,7 +734,7 @@ def get_full_info():
     except Exception:
         return _jsonify({"error": "Invalid UID"}, 400)
 
-    # MODE 1: guest uid + password
+    # ---------- MODE 1: guest uid + password ----------
     if password:
         try:
             account_data, err = asyncio.run(
@@ -777,7 +748,7 @@ def get_full_info():
 
         return _jsonify(build_response(uid, account_data))
 
-    # MODE 2: pool mode
+    # ---------- MODE 2: no password → use hardcoded pool ----------
     async def try_all_regions_parallel():
         tasks = [asyncio.create_task(GetAccountInformation(uid_int, r))
                  for r in REGION_PRIORITY]
@@ -813,7 +784,7 @@ def get_full_info():
 
 
 # ===========================================================
-# /token  —  guest login → JWT
+# /token  —  SAME OUTPUT AS OLD EXTERNAL API
 # ===========================================================
 def _build_token_response(open_id, access_token, jwt_token):
     decoded = decode_jwt(jwt_token)
@@ -876,58 +847,6 @@ def route_access_jwt():
 
 
 # ===========================================================
-# 🔍 DEBUG ENDPOINTS
-# ===========================================================
-@app.route('/test-oauth')
-def test_oauth():
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    if not uid or not password:
-        return _jsonify({"error": "uid & password required"}, 400)
-    creds, err = asyncio.run(oauth_guest(uid, password))
-    if err:
-        return _jsonify({"status": "oauth_failed", "error": err}, 400)
-    return _jsonify({
-        "status": "oauth_ok",
-        "open_id_prefix": creds[0][:15] + "...",
-        "access_token_prefix": creds[1][:15] + "...",
-    })
-
-
-@app.route('/debug-login')
-def debug_login():
-    """Raw MajorLogin response dump for troubleshooting."""
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    if not uid or not password:
-        return _jsonify({"error": "uid & password required"}, 400)
-
-    async def run():
-        creds, err = await oauth_guest(uid, password)
-        if err:
-            return {"step": "oauth_failed", "error": err}
-        open_id, access_token = creds
-
-        ml, err = await major_login_full(open_id, access_token, debug=True)
-        if err:
-            return {
-                "step": "majorlogin_failed",
-                "oauth_ok": True,
-                "open_id_prefix": open_id[:15] + "...",
-                "detail": err,
-            }
-        return {
-            "step": "success",
-            "oauth_ok": True,
-            "jwt_prefix": ml["token"][:40] + "...",
-            "serverUrl": ml["serverUrl"],
-            "lockRegion": ml.get("lockRegion"),
-        }
-
-    return _jsonify(asyncio.run(run()))
-
-
-# ===========================================================
 # MISC ROUTES
 # ===========================================================
 @app.route('/')
@@ -935,16 +854,9 @@ def home():
     return _jsonify({
         "status": "running",
         "version": "OB55",
-        "endpoints": {
-            "info_pool":   "/info?uid=UID",
-            "info_guest":  "/info?uid=UID&password=PASS",
-            "token":       "/token?uid=UID&password=PASS",
-            "access_jwt":  "/access-jwt?open_id=X&access_token=Y",
-            "test_oauth":  "/test-oauth?uid=UID&password=PASS",
-            "debug_login": "/debug-login?uid=UID&password=PASS",
-        },
+        "endpoint": "/info?uid=UID",
+        "example": "/info?uid=2084018498",
         "priority": "BD → IND → BR",
-        "proxy_enabled": bool(PROXY_URL),
         "credit": "@Itz_Jahid_X"
     })
 
